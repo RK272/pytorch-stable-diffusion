@@ -7,6 +7,9 @@ import torch
 import model_loader
 import pipeline
 from pydantic import BaseModel
+import io
+import base64
+import numpy as np
 
 from pyngrok import conf, ngrok
 
@@ -79,13 +82,26 @@ async def generate_image(prompt_data: PromptData):
             idle_device="cpu",
             tokenizer=tokenizer,
         )
-
-        output_image_path = "output_image.png"
+        output_image_path = os.path.join("static", "output_image.png")
         Image.fromarray(output_image).save(output_image_path)
 
-        return {"status": "success", "image_path": output_image_path}
+        np_image = np.array(output_image)
+
+        # Convert NumPy array to bytes
+        image_bytes = io.BytesIO()
+        Image.fromarray(np_image).save(image_bytes, format='PNG')
+        image_bytes.seek(0)
+
+        # Encode bytes to base64
+        encoded_image = base64.b64encode(image_bytes.read()).decode('utf-8')
+
+        return {"status": "success", "image_data": encoded_image}
+
+        return {"status": "success", "image_path": f"/static/output_image.png"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+       
 
 # Set up ngrok to create a tunnel to the localhost server
 #public_url = ngrok.connect(port=8000)
