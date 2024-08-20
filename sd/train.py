@@ -1,92 +1,124 @@
+import os
+from PIL import Image
 import torch
-from torch import nn, optim
-from torch.utils.data import DataLoader, Dataset
-import torchvision.transforms as transforms
-from torchvision.datasets import ImageFolder
-import mlflow
-import numpy as np
-from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+import json
 
-# Custom imports for encoder, decoder, and diffusion model
-from encoder import VAE_Encoder
-from decoder import VAE_Decoder
-from diffusion import Diffusion
+from torchvision import transforms
+from transformers import CLIPTokenizer
+import torch.optim as optim
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Dataset class
+class ImageCaptionDataset(Dataset):
+    def __init__(self, image_folder, captions_file, tokenizer, transform=None):
+        self.image_folder = image_folder
+        self.captions = self.load_captions(captions_file)
+        self.tokenizer = tokenizer
+        self.transform = transform
 
-# Define transformations for images
+    def load_captions(self, captions_file):
+        with open(captions_file, 'r') as f:
+            captions = json.load(f)
+        return captions
+
+    def __len__(self):
+        return len(self.captions)
+
+    def __getitem__(self, idx):
+        image_name = self.captions[idx]['image']
+        caption = self.captions[idx]['caption']
+
+        image_path = os.path.join(self.image_folder, image_name)
+        image = Image.open(image_path).convert('RGB')
+
+        if self.transform:
+            image = self.transform(image)
+
+        tokens = self.tokenizer.batch_encode_plus(
+            [caption], padding="max_length", max_length=77
+        ).input_ids[0]
+
+        tokens = torch.tensor(tokens, dtype=torch.long)
+
+        return image, tokens
+
+# Define transformations
+HEIGHT, WIDTH = 224, 224
 transform = transforms.Compose([
-    transforms.Resize((256, 256)),
+    transforms.Resize((HEIGHT, WIDTH)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    transforms.Normalize([0.5]*3, [0.5]*3),
 ])
 
-# Load dataset (using an example dataset here, replace with your own)
-dataset = ImageFolder(root='D:\\stabgit\\pytorch-stable-diffusion\\sd\\data', transform=transform)
-data_loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
+# Initialize the tokenizer
+tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
 
+# Instantiate the dataset
+dataset = ImageCaptionDataset(
+    image_folder="../images/",
+    captions_file="../data/captions.json",
+    tokenizer=tokenizer,
+    transform=transform
+)
 
-class StableDiffusionModel(nn.Module):
-    def __init__(self):
-        super(StableDiffusionModel, self).__init__()
-        self.encoder = VAE_Encoder()
-        self.decoder = VAE_Decoder()
-        self.diffusion = Diffusion()
+# Define batch size and DataLoader
+batch_size = 8
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
-    def forward(self, x):
-        latent = self.encoder(x)
-        diffused_latent = self.diffusion(latent)
-        reconstructed = self.decoder(diffused_latent)
-        return reconstructed
-
-model = StableDiffusionModel().to(device)
-
-
-# Define the loss function and optimizer
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
-
-def train_model(model, data_loader, criterion, optimizer, epochs=10):
+# Train function
+def train(model, dataloader, epochs=10):
     model.train()
-    
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    loss_fn = torch.nn.MSELoss()
+
     for epoch in range(epochs):
-        running_loss = 0.0
-        for i, (images, _) in enumerate(tqdm(data_loader)):
-            images = images.to(device)
+        for images, captions in dataloader:
+            images = images.to(DEVICE)
+            captions = captions.to(DEVICE)
 
-            # Zero the parameter gradients
+            outputs = model(images, captions)
+
+            loss = loss_fn(outputs, images)
+
             optimizer.zero_grad()
-
-            # Forward pass
-            outputs = model(images)
-            loss = criterion(outputs, images)
-
-            # Backward pass and optimization
             loss.backward()
             optimizer.step()
 
-            running_loss += loss.item()
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
+        save_checkpoint(epoch, model, optimizer)
 
-        # Log the epoch loss
-        epoch_loss = running_loss / len(data_loader)
-        print(f'Epoch [{epoch + 1}/{epochs}], Loss: {epoch_loss:.4f}')
-        
-        mlflow.log_metric('epoch_loss', epoch_loss, step=epoch + 1)
+# Save checkpoint function
+def save_checkpoint(epoch, model, optimizer, checkpoint_dir='../checkpoints/'):
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    checkpoint_path = os.path.join(checkpoint_dir, f'model_epoch_{epoch}.pth')
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, checkpoint_path)
+    print(f"Saved checkpoint: {checkpoint_path}")
 
-    print('Training complete')
-mlflow.set_experiment('stable_diffusion_training')
+# Device selection
+DEVICE = "cpu"
+ALLOW_CUDA = False
+ALLOW_MPS = False
 
-with mlflow.start_run():
-    # Log hyperparameters
-    mlflow.log_param('learning_rate', 1e-4)
-    mlflow.log_param('batch_size', 32)
-    mlflow.log_param('epochs', 10)
-    
-    # Training the model
-    train_model(model, data_loader, criterion, optimizer, epochs=10)
-    
-    # Log the model
-    mlflow.pytorch.log_model(model, "stable_diffusion_model")
-# Save the final model
-torch.save(model.state_dict(), 'stable_diffusion_model.pth')
+if ALLOW_CUDA and torch.cuda.is_available():
+    DEVICE = "cuda"
+elif ALLOW_MPS and torch.has_mps and torch.backends.mps.is_available():
+    DEVICE = "mps"
+
+print(f"Using device: {DEVICE}")
+
+# Assuming model_loader is your custom model loading module
+import model_loader
+
+model_file = "D:\\pytorch-stable-diffusion-main\\pytorch-stable-diffusion-main\\sd\\v1-5-pruned-emaonly.ckpt"
+models = model_loader.preload_models_from_standard_weights(model_file, DEVICE)
+
+# Train the model
+train(models, dataloader, epochs=10)
+
+
+
